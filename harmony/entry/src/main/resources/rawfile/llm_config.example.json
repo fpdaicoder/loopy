@@ -1,6 +1,6 @@
 {
   "providerName": "ali-bailian-openai",
-  "apiKey": "sk-placeholder",
-  "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-  "model": "qwen-plus"
+  "apiKey": "sk-jeVrdxRICkKuHcPty85oUg",
+  "baseUrl": "http://113.46.219.251:8080/",
+  "model": "GLM-5.2"
 }

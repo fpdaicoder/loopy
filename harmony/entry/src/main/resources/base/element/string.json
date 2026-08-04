@@ -15,6 +15,18 @@
     {
       "name": "internet_permission_reason",
       "value": "Loop calls your configured LLM endpoint over the network."
+    },
+    {
+      "name": "distributed_permission_reason",
+      "value": "Loop discovers, binds, and exchanges messages with nearby distributed devices."
+    },
+    {
+      "name": "network_info_permission_reason",
+      "value": "Loop checks and sets network state for distributed device connections."
+    },
+    {
+      "name": "photo_permission_reason",
+      "value": "Loop saves received photos and files to your album."
     }
   ]
 }

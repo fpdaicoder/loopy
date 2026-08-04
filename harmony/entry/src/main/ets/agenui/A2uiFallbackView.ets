@@ -1,8 +1,35 @@
 import { A2uiComponentDef } from '@loop/agent-core';
 
+interface DeviceRowInfo {
+  deviceId: string;
+  deviceName: string;
+}
+
 @Component
 export struct A2uiFallbackView {
   @Prop components: A2uiComponentDef[] = [];
+  @Prop bindingDevices: string[] = [];
+  @Prop boundDevices: string[] = [];
+  onDeviceSelect: (deviceId: string, deviceName: string) => void = (_id: string, _name: string) => {};
+
+  private contains(arr: string[], value: string): boolean {
+    for (let index = 0; index < arr.length; index++) {
+      if (arr[index] === value) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private rowBackgroundColor(deviceId: string): ResourceColor {
+    if (this.contains(this.boundDevices, deviceId)) {
+      return '#E8F5E9'; // 绑定成功：浅绿
+    }
+    if (this.contains(this.bindingDevices, deviceId)) {
+      return '#FFF3E0'; // 选中/绑定中：浅橘黄
+    }
+    return $r('app.color.input_stroke'); // 未绑定：灰
+  }
 
   private findComponent(id: string): A2uiComponentDef | null {
     for (const component of this.components) {
@@ -11,6 +38,32 @@ export struct A2uiFallbackView {
       }
     }
     return null;
+  }
+
+  // 从一个 Row 的 children 里提取设备信息：variant=body 是设备名，variant=caption 是 deviceId。
+  private deviceInfoForRow(rowId: string): DeviceRowInfo | null {
+    const row = this.findComponent(rowId);
+    if (row === null || row.children === undefined) {
+      return null;
+    }
+    let deviceId = '';
+    let deviceName = '';
+    for (let index = 0; index < row.children.length; index++) {
+      const child = this.findComponent(row.children[index]);
+      if (child === null) {
+        continue;
+      }
+      if (child.variant === 'caption' && child.text !== undefined) {
+        deviceId = child.text;
+      } else if (child.variant === 'body' && child.text !== undefined) {
+        deviceName = child.text;
+      }
+    }
+    if (deviceId.length === 0 && deviceName.length === 0) {
+      return null;
+    }
+    const info: DeviceRowInfo = { deviceId: deviceId, deviceName: deviceName };
+    return info;
   }
 
   private textFontSize(variant: string | undefined): number {
@@ -120,6 +173,23 @@ export struct A2uiFallbackView {
       }, (childId: string) => childId)
     }
     .width('100%')
+    .padding(this.deviceInfoForRow(nodeId) !== null ? { top: 8, bottom: 8 } : { top: 0, bottom: 0 })
+    .borderRadius(8)
+    .backgroundColor(this.rowBackgroundColorForNode(nodeId))
+    .onClick(() => {
+      const info = this.deviceInfoForRow(nodeId);
+      if (info !== null) {
+        this.onDeviceSelect(info.deviceId, info.deviceName);
+      }
+    })
+  }
+
+  private rowBackgroundColorForNode(nodeId: string): ResourceColor {
+    const info = this.deviceInfoForRow(nodeId);
+    if (info === null) {
+      return Color.Transparent;
+    }
+    return this.rowBackgroundColor(info.deviceId);
   }
 
   @Builder

@@ -5,6 +5,7 @@ import { ToolRegistry } from './ToolRegistry';
 import { LocalModel } from '../model/LocalModel';
 import { skillLogInfo, skillLogWarn } from '../skill/SkillLog';
 import { buildSkillsSection, SkillSnapshot } from '../skill/SkillSnapshot';
+import { parseJsonl } from '../a2ui/A2uiProtocol';
 
 export type AgentListener = (event: AgentEvent) => void;
 export type UiRenderHandler = (description: string) => Promise<string[]>;
@@ -200,6 +201,16 @@ export class ReActAgentRunner {
     }
     if (call.name === READ_TOOL_NAME) {
       this.emitSkillRead(call.input, observation, listener);
+    }
+    if (this.uiHandler !== null) {
+      const payload = this.tools.consumeToolUiPayload(call.name);
+      if (payload.length > 0) {
+        const lines = parseJsonl(payload);
+        if (lines.length > 0) {
+          listener(new AgentEvent(AgentEventKind.UI, lines.join('\n')));
+          observation += '\n(已将结果渲染到主页 UI 卡片)';
+        }
+      }
     }
     return observation;
   }
