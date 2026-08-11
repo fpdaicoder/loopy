@@ -1,33 +1,34 @@
 import picker from '@ohos.file.picker';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { common } from '@kit.AbilityKit';
 import fs from '@ohos.file.fs';
 import { AgentTool } from '../agent/AgentTool';
-import { AbilityConnectionClient } from '../distributed/AbilityConnectionClient';
+import { NearLinkTransport } from '../nearlink/NearLinkTransport';
 
 const LOG_DOMAIN = 0x0000;
 const LOG_TAG = 'LoopPhotoAlbum';
 const DEFAULT_LIMIT = 1;
 const MAX_LIMIT = 50;
-const MAX_PHOTO_BYTES = 5 * 1024 * 1024; // 5MB 上限，防 sendData 单次过大。
+const READ_CHUNK_BYTES = 64 * 1024; // 读图循环缓冲，避免预分配大块。
 
 interface PhotoAlbumToolInput {
   operation?: string; // 'pick'
   limit?: number;
 }
 
+
 /**
  * 相册选择工具。仅支持系统选择器路径，无需任何权限：
- *   operation=pick —— PhotoViewPicker 拉起系统相册选择器，用户选照片，读字节经分布式 sendData 发到对端。
+ *   operation=pick —— PhotoViewPicker 拉起系统相册选择器，用户选照片，读字节经星闪连接发到对端。
  * 不直接读取相册元数据（photoAccessHelper 路径需受限权限 READ_IMAGEVIDEO，普通签名声明会导致安装失败，故不提供）。
+ *
+ * 传输通道：星闪 NearLinkTransport（dataTransfer）—— 分片发送，规避 softbus 4MiB 单片限制，大文件可靠。
+ * softbus 已屏蔽，未建立星闪连接时直接提示先 nearlink_device connect。
  */
 export class PhotoAlbumTool implements AgentTool {
-  private context: common.UIAbilityContext;
-  private connClient: AbilityConnectionClient;
+  private nearLinkTransport: NearLinkTransport | null;
 
-  constructor(context: common.UIAbilityContext, connClient: AbilityConnectionClient) {
-    this.context = context;
-    this.connClient = connClient;
+  constructor(nearLinkTransport: NearLinkTransport | null = null) {
+    this.nearLinkTransport = nearLinkTransport;
   }
 
   name(): string {
@@ -35,10 +36,12 @@ export class PhotoAlbumTool implements AgentTool {
   }
 
   description(): string {
-    return '选择设备相册照片并发送给对端设备（选图后自动经已建立的分布式连接发送字节，无需先调 distributed_device）。' +
-      '{"operation":"pick","limit":1} —— 拉起系统相册选择器，用户手动选照片；' +
-      '若已与对端建立分布式连接（连接状态非 disconnected），自动读取照片字节经 sendData 发送到对端（对端存沙箱+提供保存按钮）。无需权限。' +
-      '收到「选照片/发照片/获取照片」类请求时直接调本工具 pick，不要先调 distributed_device search/discover。';
+    return '从**本机**相册选照片并发送给对端设备（本机是发送方，不是接收方）。' +
+      '{"operation":"pick","limit":1} —— 拉起系统相册选择器，用户手动选照片，选完经星闪连接发送给对端。' +
+      '经星闪 dataTransfer 分片传输（大文件可靠，无 4MiB 限制）。' +
+      '需先 nearlink_device connect 建立星闪连接；未连接时 pick 仅选图不发。' +
+      '注意：若用户要「从对端获取照片」（即从附近手机拉照片到本机），应先 nearlink_device connect 连接对端，' +
+      '再让对端执行 photo_album pick 发过来，本机用 nearlink_device received 接收——本工具 pick 是本机发送方向，不是接收方向。';
   }
 
   async run(input: string): Promise<string> {
@@ -81,17 +84,13 @@ export class PhotoAlbumTool implements AgentTool {
       }
       hilog.info(LOG_DOMAIN, LOG_TAG, 'pick got %{public}d uris', uris.length);
 
-      // 发送判定：source 端看 connClient adopted 状态（connected）；sink 端看
-      // AppStorage('loopSinkSessionId')（onCollaborate 建的会话，API 确认双向支持 sendData）。
-      const sinkSessionId = AppStorage.get<number>('loopSinkSessionId') ?? -1;
-      const status = this.connClient.statusText();
-      const connected = sinkSessionId >= 0 || status.startsWith('connected');
+      const connected = this.isAnyTransportReady();
       const sent: string[] = [];
       const skipped: string[] = [];
       for (let index = 0; index < uris.length; index++) {
         const uri = uris[index];
         if (connected) {
-          const sendResult = await this.sendPhotoUri(uri, sinkSessionId);
+          const sendResult = await this.sendPhotoUri(uri);
           sent.push(`- ${uri} → ${sendResult}`);
         } else {
           skipped.push(`- ${uri}（未连接对端，未发送）`);
@@ -109,34 +108,60 @@ export class PhotoAlbumTool implements AgentTool {
     }
   }
 
+  /** 星闪就绪即视为可发送。softbus 已屏蔽。 */
+  private isAnyTransportReady(): boolean {
+    return this.nearLinkTransport !== null && this.nearLinkTransport.isReady();
+  }
+
   /**
-   * 读 URI 字节发送。sink 端（sinkSessionId>=0）用 sendDataOnSession 直接发；
-   * source 端用 connClient.sendData（adopted）。API 确认会话双向支持 sendData。
+   * 读 URI 字节经星闪分片发送。softbus 已屏蔽，未连接星闪时直接报错提示先 connect。
    */
-  private async sendPhotoUri(uri: string, sinkSessionId: number): Promise<string> {
+  private async sendPhotoUri(uri: string): Promise<string> {
+    if (this.nearLinkTransport === null || !this.nearLinkTransport.isReady()) {
+      return '未建立星闪连接，请先 nearlink_device execute action=connect 建链。';
+    }
+    return await this.sendViaNearLink(uri);
+  }
+
+  /**
+   * 星闪传输：读全图字节进单缓冲 → 一次 transport.writeFileData 调用。
+   * writeFileData 内部按 getChunkSize() 切片，每片前内嵌二进制头（magic/kind/seq/
+   * index/totalChunks/dataLen），单片一次 writeData——不再分独立 sendText 控制帧。
+   * 收端 FileReassembler 按 magic=0x55 解析头，提取数据写入沙箱，收齐触发 SaveButton。
+   * seq 全局自增保证文件名唯一（收端存 recv_<seq>.bin）。
+   */
+  private async sendViaNearLink(uri: string): Promise<string> {
+    const transport = this.nearLinkTransport!;
     let file: fs.File | undefined;
     try {
-      // 只读打开媒体库 URI（file://media/...）。用 READ_ONLY 而非 READ_WRITE：
-      // READ_WRITE 申请写权限，系统对媒体库只读 URI 拒绝 → Operation not permitted。
-      // （OpenMode 三态为 READ_ONLY / WRITE_ONLY / READ_WRITE，无单独 READ。）
       file = fs.openSync(uri, fs.OpenMode.READ_ONLY);
-      // 预分配上限缓冲，readSync 返回实际读取字节数，再 slice 出精确大小发送。
-      const buffer = new ArrayBuffer(MAX_PHOTO_BYTES);
-      const bytesRead = fs.readSync(file.fd, buffer);
-      if (bytesRead <= 0) {
+      const totalSize = await this.readFileSize(file);
+      if (totalSize <= 0) {
         return '文件为空';
       }
-      const data = buffer.slice(0, bytesRead);
-      hilog.info(LOG_DOMAIN, LOG_TAG, 'sendPhotoUri uri=%{public}s bytes=%{public}d', uri, bytesRead);
-      // sink 端用已知 sessionId 直接发（sendDataOnSession 绕 adopted 状态检查）；
-      // source 端走 adopted 的 sendData。API 确认会话双向支持 sendData。
-      if (sinkSessionId >= 0) {
-        return await this.connClient.sendDataOnSession(sinkSessionId, data);
+      hilog.info(LOG_DOMAIN, LOG_TAG, 'total size %{public}d', totalSize);
+      const seq = (AppStorage.get<number>('loopSentFileSeq') ?? 0) + 1;
+      AppStorage.setOrCreate<number>('loopSentFileSeq', seq);
+
+      // 整文件读进单缓冲，交给 transport.writeFileData 切片+内嵌头发送
+      const buffer = new ArrayBuffer(totalSize);
+      let sent = 0;
+      while (sent < totalSize) {
+        const bytesRead = fs.readSync(file.fd, buffer, { offset: sent, length: totalSize - sent });
+        if (bytesRead <= 0) {
+          break;
+        }
+        sent += bytesRead;
       }
-      return await this.connClient.sendData(data);
+      const payload = sent < totalSize ? buffer.slice(0, sent) : buffer;
+      const sentBytes = await transport.writeFileData(payload, seq);
+
+      hilog.info(LOG_DOMAIN, LOG_TAG, 'nearLink sent uri=%{public}s bytes=%{public}d (whole-file via writeFileData)',
+        uri, sentBytes);
+      return `已发送 ${sentBytes} 字节（星闪分片，内嵌头）`;
     } catch (error) {
       const message = error instanceof Error ? error.message : `${error}`;
-      hilog.error(LOG_DOMAIN, LOG_TAG, 'sendPhotoUri failed uri=%{public}s err=%{public}s', uri, message);
+      hilog.error(LOG_DOMAIN, LOG_TAG, 'sendViaNearLink failed uri=%{public}s err=%{public}s', uri, message);
       return `发送失败：${message}`;
     } finally {
       if (file !== undefined) {
@@ -146,6 +171,32 @@ export class PhotoAlbumTool implements AgentTool {
         }
       }
     }
+  }
+
+  /** 读文件总大小：fs.statSync(fd) 不可靠时循环 readSync 探测。优先 statSync。 */
+  private async readFileSize(file: fs.File): Promise<number> {
+    try {
+      const stat = fs.statSync(file.fd);
+      if (stat.size > 0) {
+        return stat.size;
+      }
+    } catch (_error) {
+      // stat 失败时回退循环探测
+    }
+    // 循环读至 EOF 累计字节数（不预知大小时安全）。
+    const probe = new ArrayBuffer(READ_CHUNK_BYTES);
+    let total = 0;
+    let read = 0;
+    do {
+      read = fs.readSync(file.fd, probe, { offset: total });
+      total += read > 0 ? read : 0;
+    } while (read > 0);
+    // 复位 fd 偏移到 0 供后续发送读
+    try {
+      fs.readSync(file.fd, new ArrayBuffer(0), { offset: 0 });
+    } catch (_error) {
+    }
+    return total;
   }
 
   /** 从 select 结果的 JSON 序列化串里正则提取 URI（datasync://、file://、storage:// 等），避免依赖不确定的字段名。 */

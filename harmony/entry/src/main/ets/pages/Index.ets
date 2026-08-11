@@ -6,7 +6,7 @@ import {
   AgentEvent,
   AgentEventKind,
   A2uiAgentRunner,
-  buildDeviceListCardJsonl,
+  buildNearLinkDeviceCardJsonl,
   clearStoredConversation,
   ConversationContext,
   ConversationRole,
@@ -14,8 +14,9 @@ import {
   createConfiguredLoopToolRegistry,
   createLoopModelInfo,
   createSkillSnapshot,
-  DistributedDeviceTool,
   loadConversation,
+  NearLinkDeviceTool,
+  NearLinkTransport,
   parseJsonl,
   ReActAgentRunner,
   saveConversation,
@@ -42,28 +43,14 @@ struct Index {
   @State hasUiPanel: boolean = false;
   @State bindingDevices: string[] = [];
   @State boundDevices: string[] = [];
-  // sink 端：本设备被对端 connect 拉起并已接管协同会话。此时用户输入直接经
-  // distributed_device send 回发，不走 agent（避免依赖 LLM 选择调用 send）。
-  @State isSink: boolean = false;
-  // sink 端协同：被对端 connect 拉起后，onCollaborate 里 acceptConnect 建立的会话，
-  // 其 receiveMessage 把消息塞进 AppStorage('loopSinkPendingMessages') 并自增本序号。
-  // 序号变化即有新消息，drain 队列追加到 transcript（仅展示，不自动回发）。
-  @StorageProp('loopSinkMessageSeq') @Watch('onSinkMessageSeqChanged') loopSinkMessageSeq: number = 0;
-  // sink 端会话 sessionId：EntryAbility 在 acceptConnect 成功后写入。出现即接管进
-  // AbilityConnectionClient，使本端 distributed_device 的 send/received 可用（可回发）。
-  @StorageProp('loopSinkSessionId') @Watch('onSinkSessionIdChanged') loopSinkSessionId: number = -1;
-  // source 端：本端 connect 建立会话后，对端回发的消息由 AbilityConnectionClient 的
-  // receiveMessage 回调塞进 AppStorage('loopSourcePendingMessages') 并自增本序号。
-  // 序号变化即 drain 队列，以「对端」身份追加到 transcript（自动展示，无需 agent 调 received）。
-  @StorageProp('loopSourceMessageSeq') @Watch('onSourceMessageSeqChanged') loopSourceMessageSeq: number = 0;
-  // sink 端收到文件：EntryAbility 存沙箱后把路径写进 AppStorage 并自增本序号。
+  // sink/source 端收到星闪文件：FileReassembler 收齐后把沙箱路径写进 AppStorage 并自增序号。
   // 序号变化即取路径存入 pendingFilePath，主页显示 SaveButton，点击控件授权存进图库。
   @StorageProp('loopSinkFileSeq') @Watch('onSinkFileArrived') loopSinkFileSeq: number = 0;
-  // source 端收到对端回发的文件：AbilityConnectionClient 存沙箱后写 loopSourcePendingFile
-  // 并自增本序号。source/sink 任一端收到文件都触发 pendingFilePath 渲染 SaveButton。
   @StorageProp('loopSourceFileSeq') @Watch('onSourceFileArrived') loopSourceFileSeq: number = 0;
   // 待存进图库的文件沙箱路径；非空时主页显示「保存到相册」SaveButton。
   @State pendingFilePath: string = '';
+  // agent 忙时收到的对端文本消息排队；当前轮结束后 drain 逐条注入 agent loop。
+  private pendingPeerMessages: string[] = [];
 
   private scroller: Scroller = new Scroller();
   private conversation: ConversationContext = new ConversationContext();
@@ -83,12 +70,7 @@ struct Index {
     createLoopModelInfo(context).then((info) => {
       this.updateModelStatus(info.mode, info.modelName);
     });
-    // 若本进程已是 sink（onCollaborate 早于首帧把 sessionId 写入 AppStorage），
-    // 首帧兜底接管，避免 @Watch 因值未变化而漏触发。
-    const existingSinkSession = AppStorage.get<number>('loopSinkSessionId') ?? -1;
-    if (existingSinkSession >= 0) {
-      this.onSinkSessionIdChanged();
-    }
+    this.wirePeerMessageBridge();
   }
 
   private createToolRegistry(context: common.UIAbilityContext, skillSnapshot?: SkillSnapshot): Promise<ToolRegistry> {
@@ -119,47 +101,36 @@ struct Index {
   }
 
   /**
-   * sink 端收到对端消息：drain AppStorage 队列，最后一条作为 task 注入 agent。
-   * agent 推理后可能调 photo_album pick（回发照片）或 distributed_device send（回发文本）。
-   * 之前的消息作为对端发言显示，避免丢上下文。
+   * 注册星闪文本消息回调：对端发来的纯文本（非 file_* 协议帧）注入本端 agent loop，
+   * 由 agent 触发工具调用（如 photo_album pick）在现有星闪连接上回发照片。
+   * transport 由 EntryAbility（sink）或 ToolRegistry（source）建好放 AppStorage，
+   * 无论哪端都能接到对端文本。
    */
-  onSinkMessageSeqChanged(): void {
-    const pending = AppStorage.get<string[]>('loopSinkPendingMessages');
-    if (pending === undefined || pending === null || pending.length === 0) {
+  private wirePeerMessageBridge(): void {
+    const transport = AppStorage.get<NearLinkTransport>('loopNearLinkTransport');
+    if (transport === undefined || transport === null) {
+      // transport 尚未建好（EntryAbility/ToolRegistry 异步），稍后重试
+      setTimeout((): void => this.wirePeerMessageBridge(), 500);
       return;
     }
-    AppStorage.setOrCreate<string[]>('loopSinkPendingMessages', []);
-    let lastTask: string = '';
-    for (let index = 0; index < pending.length; index++) {
-      const msg = pending[index];
-      if (msg.length > 0) {
-        lastTask = msg;
-      }
-    }
-    if (lastTask.length === 0) {
-      return;
-    }
-    // sink 端收到对端指令后跑 agent 自动响应（选照片/回发文本）。
-    this.runAgentWithTask(lastTask, false);
+    transport.onTextMessage((text: string, _fromAddress: string): void => {
+      this.enqueuePeerMessage(text);
+    });
   }
 
   /**
-   * source 端收到对端回发消息：序号变化即 drain AppStorage('loopSourcePendingMessages')，
-   * 逐条以「对端」身份追加到 transcript。自动展示，无需 agent 调 distributed_device received。
-   * 与 sink 端路径独立：agent 的 received action 仍读 AbilityConnectionClient.receivedMessages。
+   * 对端消息入队：agent 空闲直接跑，忙时排队（当前轮 finally 块 drain）。
+   * 避免并发跑多个 agent 轮破坏 ReAct 状态机。
    */
-  onSourceMessageSeqChanged(): void {
-    const pending = AppStorage.get<string[]>('loopSourcePendingMessages');
-    if (pending === undefined || pending === null || pending.length === 0) {
+  private enqueuePeerMessage(text: string): void {
+    if (text.trim().length === 0) {
       return;
     }
-    AppStorage.setOrCreate<string[]>('loopSourcePendingMessages', []);
-    for (let index = 0; index < pending.length; index++) {
-      const msg = pending[index];
-      if (msg.length > 0) {
-        this.appendLine('对端', msg);
-      }
+    if (this.sending) {
+      this.pendingPeerMessages.push(text);
+      return;
     }
+    this.runAgentWithTask(text, false);
   }
 
   /**
@@ -234,58 +205,6 @@ struct Index {
       fs.closeSync(target);
     }
     return targetUri;
-  }
-
-  /**
-   * sink 端接管协同会话：EntryAbility acceptConnect 成功后把 sessionId 写入
-   * AppStorage('loopSinkSessionId')。本回调把它接入 AbilityConnectionClient，
-   * 使本端 distributed_device 的 send/received 可用——用户手动输入由 agent 经
-   * distributed_device send 回发。
-   */
-  onSinkSessionIdChanged(): void {
-    const sessionId = AppStorage.get<number>('loopSinkSessionId') ?? -1;
-    if (sessionId < 0) {
-      return;
-    }
-    const registryPromise = this.toolRegistryPromise;
-    if (registryPromise === null) {
-      return;
-    }
-    registryPromise.then((registry: ToolRegistry): void => {
-      const tool = registry.getTool('distributed_device');
-      if (tool instanceof DistributedDeviceTool) {
-        tool.adoptSinkSession(sessionId);
-        this.isSink = true;
-        this.appendLine('Loop', `已接管协同会话，可输入消息回发对端（sessionId=${sessionId}）。`);
-      }
-    }).catch((_error: Error): void => {});
-  }
-
-  /**
-   * sink 端直接回发：用户输入的消息经 distributed_device 的 send 动作发往对端，
-   * 不走 ReAct agent。失败时把错误作为 Observation 展示，并复位 sending。
-   */
-  private async sendAsSink(message: string): Promise<void> {
-    try {
-      const registry = await this.toolRegistryPromise;
-      if (registry === null) {
-        this.appendLine('Error', '工具未就绪，无法回发。');
-        return;
-      }
-      const tool = registry.getTool('distributed_device');
-      if (tool instanceof DistributedDeviceTool) {
-        // 直接用 onCollaborate 建立的 sink 会话回发，不经 tool 的 send action（那条依赖 adopted 状态）。
-        const result = await tool.sendAsSink(message);
-        this.appendLine('Observation', result);
-      } else {
-        this.appendLine('Error', 'distributed_device 工具未就绪，无法回发。');
-      }
-    } catch (error) {
-      const text = error instanceof Error ? error.message : `${error}`;
-      this.appendLine('Error', `回发失败：${text}`);
-    } finally {
-      this.sending = false;
-    }
   }
 
   build() {
@@ -427,9 +346,8 @@ struct Index {
   }
 
   /**
-   * sink 端收到对端消息后自动注入 agent：对端发的「选照片」类指令经 LLM 推理，
-   * agent 调 photo_album pick（自动经 connClient.sendData 回发照片字节）或
-   * distributed_device send（回发文本）。sink 端也走完整 ReAct 流程，不再直接 sendAsSink。
+   * 收到用户/对端消息后跑 ReAct agent：photo_album pick 经星闪回发照片，或 nearlink_device
+   * send 回发文本。softbus 已屏蔽，照片/文本均走星闪 dataTransfer。
    */
   private async runAgentWithTask(task: string, fromUser: boolean): Promise<void> {
     if (task.length === 0 || this.sending) {
@@ -505,6 +423,11 @@ struct Index {
         saveConversation(this.getAbilityContext(), this.conversation);
       }
       this.sending = false;
+      // drain 对端排队消息：当前 agent 轮结束，取下一条逐个跑（串行不并发）。
+      if (this.pendingPeerMessages.length > 0) {
+        const next = this.pendingPeerMessages.shift() as string;
+        this.enqueuePeerMessage(next);
+      }
     }
   }
 
@@ -514,16 +437,16 @@ struct Index {
     const scripted = new ScriptedA2uiModel();
 
     return async (description: string): Promise<string[]> => {
-      // 确定性分支：distributed_device:list 直接用脚本化卡片展示设备列表，跳过 LLM，保真。
-      if (description.trim().startsWith('distributed_device:list')) {
+      // 确定性分支：nearlink_device:list 直接用脚本化卡片展示星闪设备列表，跳过 LLM，保真。
+      if (description.trim().startsWith('nearlink_device:list')) {
         try {
           const registryPromise = this.toolRegistryPromise;
           if (registryPromise !== null) {
             const registry = await registryPromise;
-            const tool = registry.getTool('distributed_device');
-            if (tool instanceof DistributedDeviceTool) {
+            const tool = registry.getTool('nearlink_device');
+            if (tool instanceof NearLinkDeviceTool) {
               const devices = tool.lastDevices;
-              return parseJsonl(buildDeviceListCardJsonl(devices));
+              return parseJsonl(buildNearLinkDeviceCardJsonl(devices));
             }
           }
         } catch (_error) {
@@ -638,7 +561,7 @@ struct Index {
     }
     this.bindingDevices = this.appendId(this.bindingDevices, deviceId);
     const name = deviceName.length > 0 ? deviceName : '该设备';
-    this.appendLine('You', `绑定设备${name}`);
+    this.appendLine('You', `连接星闪设备${name}`);
     try {
       const registryPromise = this.toolRegistryPromise;
       if (registryPromise === null) {
@@ -646,10 +569,10 @@ struct Index {
         return;
       }
       const registry = await registryPromise;
-      const tool = registry.getTool('distributed_device');
-      if (tool instanceof DistributedDeviceTool) {
-        // 先启动超时兜底，再 await bindTarget。bindTarget 在对端不响应时回调可能永不触发，
-        // 若 setTimeout 放在 await 之后会被挂起的 Promise 永久阻塞。
+      const tool = registry.getTool('nearlink_device');
+      if (tool instanceof NearLinkDeviceTool) {
+        // 星闪连接：对端已广播则 connect 即时返回。无 PIN 环节，但有链路未就绪风险，
+        // 留超时兜底防止 connect 挂起。deviceId 实际是卡片行的 address（MAC）。
         let timedOut = false;
         const timer = setTimeout((): void => {
           timedOut = true;
@@ -657,11 +580,12 @@ struct Index {
             const next: string[] = this.removeId(this.bindingDevices, deviceId);
             this.bindingDevices = [];
             this.bindingDevices = next;
-            this.appendLine('Loop', `绑定${name}超时，对端可能未响应或 PIN 码认证失败。`);
+            this.appendLine('Loop', `连接${name}超时，对端可能未启动广播或链路未就绪。`);
           }
         }, 30000);
         try {
-          await (tool as DistributedDeviceTool).bindDevice(deviceId);
+          const result = await (tool as NearLinkDeviceTool).connectDevice(deviceId);
+          this.appendLine('Loop', result);
         } finally {
           if (!timedOut) {
             clearTimeout(timer);
@@ -672,7 +596,7 @@ struct Index {
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : `${error}`;
-      this.appendLine('Error', `绑定失败：${message}`);
+      this.appendLine('Error', `连接失败：${message}`);
       this.bindingDevices = this.removeId(this.bindingDevices, deviceId);
     }
   }

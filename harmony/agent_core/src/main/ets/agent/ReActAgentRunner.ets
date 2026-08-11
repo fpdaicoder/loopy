@@ -14,6 +14,39 @@ const UI_TOOL_NAME = 'ui';
 const READ_TOOL_NAME = 'read';
 const REACT_TAGS: string[] = ['Thought:', 'Execution:', 'Action:', 'Observation:', 'Final:'];
 
+/** 标签匹配结果：start=标签起始下标（-1 表未找到），length=命中的标签串长度（中英文别名长度不同）。 */
+interface TagMatch {
+  start: number;
+  length: number;
+}
+
+/**
+ * ReAct 标签的中文别名。GLM 等中文模型在中文上下文里常把英文标签本地化
+ * （Thought→思考、Execution→执行、Action→动作、Observation→观察、Final→最终/最终答案），
+ * 且可能用中文全角冒号「：」或英文半角冒号「:」。这里把每个英文标签映射到它的中文别名集合，
+ * 让 findTagStart/extractTaggedLines/truncateAtFirstAction 同时认英文与中文，避免模型用中文
+ * 输出「动作：photo_album[...]」时解析器认不出 Action 导致工具不执行。
+ */
+const REACT_TAG_ALIASES: Map<string, string[]> = new Map<string, string[]>([
+  ['Thought:', ['思考:', '思考：']],
+  ['Execution:', ['执行:', '执行：']],
+  ['Action:', ['动作:', '动作：']],
+  ['Observation:', ['观察:', '观察：']],
+  ['Final:', ['最终:', '最终：', '最终答案:', '最终答案：']]
+]);
+
+/** 取某英文标签的全部识别形态（含自身与中文别名，含半角/全角冒号）。 */
+function tagVariants(prefix: string): string[] {
+  const variants: string[] = [prefix];
+  const aliases = REACT_TAG_ALIASES.get(prefix);
+  if (aliases !== undefined) {
+    for (let i = 0; i < aliases.length; i++) {
+      variants.push(aliases[i]);
+    }
+  }
+  return variants;
+}
+
 type ExecutionMode = 'parallel' | 'serial';
 
 function padDatePart(value: number): string {
@@ -102,14 +135,18 @@ export class ReActAgentRunner {
 
       this.emitResponse(response, listener);
 
-      const finalAnswer = this.readLineValue(response, 'Final:');
-      if (finalAnswer !== null) {
-        listener(new AgentEvent(AgentEventKind.FINAL, finalAnswer));
-        return;
-      }
-
       const plan = this.parseActionPlan(response);
+
+      // ReAct 循环纪律：模型在一个 response 里自编多轮 Thought/Action/Observation/Final
+      // 是违规（Observation 必须由工具真实返回）。若本 response 含真实 Action，
+      // 则无视模型自编的 Final——先执行 Action，不让"幻觉 Final"提前结束循环。
+      // 仅当无 Action 时才认 Final 为最终答案。
       if (plan === null) {
+        const finalAnswer = this.readLineValue(response, 'Final:');
+        if (finalAnswer !== null) {
+          listener(new AgentEvent(AgentEventKind.FINAL, finalAnswer));
+          return;
+        }
         listener(new AgentEvent(AgentEventKind.ERROR, 'Model did not return an Action or Final answer.'));
         return;
       }
@@ -146,7 +183,9 @@ export class ReActAgentRunner {
         return;
       }
 
-      scratchpad.push(response);
+      // scratchpad 只保留到首个 Action（截断模型自编的 Observation/Final），
+      // 真实 Observation 由工具返回后追加。防止模型自编内容污染下一轮上下文。
+      scratchpad.push(this.truncateAtFirstAction(response));
       for (const observation of observationsForModel) {
         scratchpad.push(observation);
       }
@@ -277,6 +316,7 @@ export class ReActAgentRunner {
     let prompt = 'You are Loop, a HarmonyOS ReAct agent with tools.\n';
     prompt += 'Current device local datetime: ' + currentLocalDateTime() + '. Resolve relative dates yourself before calling tools.\n';
     prompt += 'Use Thought, Execution, Action, Observation, and Final.\n';
+    prompt += 'ReAct discipline (CRITICAL): one response = at most ONE step. Emit Thought, then Execution, then Action, then STOP. Do NOT write Observation or Final in the same response as an Action — Observation comes only from real tool execution in the next step, and Final only when no Action remains. Never fabricate an Observation or assume a tool succeeded without seeing its returned Observation. If you have not received an Observation for an Action, you must wait; do not proceed to a Final.\n';
     prompt += 'For tool use, add Execution: serial or Execution: parallel, then one Action: tool_name[input] line per call.\n';
     prompt += 'Use parallel only when every call is independent. Use serial for ordered calls whose inputs are already known. If a later call needs an earlier result, emit only the first Action and wait for its Observation.\n';
     prompt += 'Never run read, ui, composio, or modelscope in parallel. A missing or unsafe Execution mode falls back to serial.\n';
@@ -331,30 +371,48 @@ export class ReActAgentRunner {
   }
 
   private readLineValue(text: string, prefix: string): string | null {
-    const start = this.findTagStart(text, prefix);
-    if (start < 0) {
+    const match = this.findTagMatch(text, prefix);
+    if (match.start < 0) {
       return null;
     }
-    const valueStart = start + prefix.length;
+    const valueStart = match.start + match.length;
     const tail = text.substring(valueStart);
     const next = this.findNextTagStart(tail, prefix);
     const value = next < 0 ? tail : tail.substring(0, next);
     return value.trim();
   }
 
+  /** 找到标签首次出现的合法位置（兼容英文与中文别名）。仅返回起始下标。 */
   private findTagStart(text: string, prefix: string): number {
-    let searchFrom = 0;
-    while (searchFrom < text.length) {
-      const index = text.indexOf(prefix, searchFrom);
-      if (index < 0) {
-        return -1;
+    return this.findTagMatch(text, prefix).start;
+  }
+
+  /** 找到标签首次出现的合法位置，同时返回匹配到的标签串长度（中英文别名长度不同）。 */
+  private findTagMatch(text: string, prefix: string): TagMatch {
+    // 同时尝试英文标签与其中文别名（思考/执行/动作/观察/最终），取最早出现的合法边界匹配。
+    const variants = tagVariants(prefix);
+    let bestStart = -1;
+    let bestLength = 0;
+    for (let v = 0; v < variants.length; v++) {
+      const variant = variants[v];
+      let searchFrom = 0;
+      while (searchFrom < text.length) {
+        const index = text.indexOf(variant, searchFrom);
+        if (index < 0) {
+          break;
+        }
+        if (this.isTagBoundary(text, index)) {
+          if (bestStart < 0 || index < bestStart) {
+            bestStart = index;
+            bestLength = variant.length;
+          }
+          break;
+        }
+        searchFrom = index + variant.length;
       }
-      if (this.isTagBoundary(text, index)) {
-        return index;
-      }
-      searchFrom = index + prefix.length;
     }
-    return -1;
+    const match: TagMatch = { start: bestStart, length: bestLength };
+    return match;
   }
 
   private findNextTagStart(text: string, currentPrefix: string): number {
@@ -396,6 +454,63 @@ export class ReActAgentRunner {
     return calls.length === 0 ? null : new ActionPlan(this.parseExecutionMode(response, calls), calls);
   }
 
+  /**
+   * 截断 response 到首个 Action: 行之后（含该行）。
+   * 防止模型在一个 response 里自编多轮 Observation/Final 污染 scratchpad——
+   * 真实 Observation 由工具返回后单独追加，Final 仅在无 Action 时被认作结束。
+   */
+  private truncateAtFirstAction(response: string): string {
+    const actionVariants = tagVariants('Action:');
+    const lines = response.split(/\r?\n/);
+    let firstActionIndex = -1;
+    for (let index = 0; index < lines.length; index++) {
+      const trimmed = lines[index].trim();
+      for (let v = 0; v < actionVariants.length; v++) {
+        if (trimmed.startsWith(actionVariants[v])) {
+          firstActionIndex = index;
+          break;
+        }
+      }
+      if (firstActionIndex >= 0) {
+        break;
+      }
+    }
+    if (firstActionIndex < 0) {
+      return response;
+    }
+    // 保留首个 Action: 及其后紧跟该 Action 的连续 Action 行（parallel 多 Action 同行场景）。
+    // 遇到 Observation:/Final:/Thought:（下一个 ReAct 段）即停止。
+    const stopVariants: string[] = [];
+    this.pushAll(stopVariants, tagVariants('Observation:'));
+    this.pushAll(stopVariants, tagVariants('Final:'));
+    this.pushAll(stopVariants, tagVariants('Thought:'));
+    const kept: string[] = [];
+    for (let index = 0; index <= firstActionIndex; index++) {
+      kept.push(lines[index]);
+    }
+    for (let index = firstActionIndex + 1; index < lines.length; index++) {
+      const trimmed = lines[index].trim();
+      let stop = false;
+      for (let v = 0; v < stopVariants.length; v++) {
+        if (trimmed.startsWith(stopVariants[v])) {
+          stop = true;
+          break;
+        }
+      }
+      if (stop) {
+        break;
+      }
+      kept.push(lines[index]);
+    }
+    return kept.join('\n');
+  }
+
+  private pushAll(target: string[], source: string[]): void {
+    for (let i = 0; i < source.length; i++) {
+      target.push(source[i]);
+    }
+  }
+
   private parseExecutionMode(response: string, calls: ToolCall[]): ExecutionMode {
     const raw = this.readLineValue(response, 'Execution:');
     if (raw === null) {
@@ -418,11 +533,21 @@ export class ReActAgentRunner {
   }
 
   private extractTaggedLines(text: string, prefix: string): string[] {
+    // 兼容中文别名（动作：/思考：等）与全角冒号：逐行匹配首个命中的变体，截取其后的内容。
+    const variants = tagVariants(prefix);
     const values: string[] = [];
     for (const line of text.split(/\r?\n/)) {
       const trimmed = line.trim();
-      if (trimmed.startsWith(prefix)) {
-        values.push(trimmed.substring(prefix.length).trim());
+      let matched: string | null = null;
+      for (let v = 0; v < variants.length; v++) {
+        const variant = variants[v];
+        if (trimmed.startsWith(variant)) {
+          matched = variant;
+          break;
+        }
+      }
+      if (matched !== null) {
+        values.push(trimmed.substring(matched.length).trim());
       }
     }
     return values;

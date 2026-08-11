@@ -36,11 +36,16 @@ export { A2uiComponentDef, CreateSurfaceBody, UpdateComponentsBody } from './src
 export { A2uiModel } from './src/main/ets/a2ui/A2uiModel';
 export { A2uiAgentRunner, A2uiLineListener, A2uiErrorListener } from './src/main/ets/a2ui/A2uiAgentRunner';
 export { createA2uiModelInfo, A2uiModelInfo } from './src/main/ets/a2ui/A2uiModelFactory';
-export { buildDeviceListCardComponents, buildDeviceListCardJsonl } from './src/main/ets/a2ui/DeviceListCard';
+export { buildDeviceListCardComponents, buildDeviceListCardJsonl, buildNearLinkDeviceCardComponents, buildNearLinkDeviceCardJsonl } from './src/main/ets/a2ui/DeviceListCard';
 export { PhotoAlbumTool } from './src/main/ets/album/PhotoAlbumTool';
 export { DistributedDeviceTool } from './src/main/ets/distributed/DistributedDeviceTool';
 export { AbilityConnectionClient, ReceivedDataHandler } from './src/main/ets/distributed/AbilityConnectionClient';
 export { DiscoveredDevice } from './src/main/ets/distributed/DeviceManagerClient';
+export { NearLinkScanner, NearLinkDevice } from './src/main/ets/nearlink/NearLinkScanner';
+export { NearLinkAdvertiser } from './src/main/ets/nearlink/NearLinkAdvertiser';
+export { NearLinkTransport, NearLinkDataHandler, NEARLINK_PORT_UUID, NEARLINK_MANUFACTURER_ID, NEARLINK_MANUFACTURER_PAYLOAD } from './src/main/ets/nearlink/NearLinkTransport';
+export { NearLinkDeviceTool } from './src/main/ets/nearlink/NearLinkDeviceTool';
+export { FileReassembler } from './src/main/ets/nearlink/FileReassembler';
 export { LoopBackend, aiphoneToolDescriptionForModel, isExplicitLuckinOrderPrompt, parseLoopToolInputArgs } from './src/main/ets/aiphone/LoopBackend';
 export { LoopBackendCallbacks, LoopBackendRequest, LoopMessage, LoopModelSettings, LoopRunResult, LoopToolTrace } from './src/main/ets/aiphone/LoopBackendTypes';
 export { aiphoneErrorJsonl, aiphoneInfoJsonl, splitJsonl } from './src/main/ets/aiphone/AiphoneA2ui';

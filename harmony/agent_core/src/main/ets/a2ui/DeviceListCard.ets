@@ -6,6 +6,7 @@ import {
 } from './A2uiTypes';
 import { A2UI_VERSION, AGENUI_CATALOG_ID, buildCreateSurface, newSurfaceId } from './A2uiProtocol';
 import { DiscoveredDevice } from '../distributed/DeviceManagerClient';
+import { NearLinkDevice } from '../nearlink/NearLinkScanner';
 
 const MAX_DEVICE_ROWS: number = 12;
 
@@ -91,6 +92,98 @@ export function buildDeviceListCardJsonl(devices: DiscoveredDevice[]): string {
   const createLine = buildCreateSurface(surfaceId);
 
   const components = buildDeviceListCardComponents(devices);
+  const updateBody: UpdateComponentsBody = {
+    surfaceId: surfaceId,
+    components: components
+  };
+  const updateEnvelope: UpdateComponentsEnvelope = {
+    version: A2UI_VERSION,
+    updateComponents: updateBody
+  };
+  const componentsLine = JSON.stringify(updateEnvelope);
+
+  return `${createLine}\n${componentsLine}`;
+}
+
+/**
+ * 拼装星闪扫描设备列表卡片组件树。结构与 {@link buildDeviceListCardComponents} 一致，
+ * 但副文本用 address（MAC）替代 deviceId，供 nearlink_device search 结果展示。
+ */
+export function buildNearLinkDeviceCardComponents(devices: NearLinkDevice[]): A2uiComponentDef[] {
+  const root: A2uiComponentDef = {
+    id: 'root',
+    component: 'Card',
+    child: 'col'
+  };
+  const children: string[] = ['title'];
+  const components: A2uiComponentDef[] = [root, {
+    id: 'col',
+    component: 'Column',
+    children: children,
+    align: 'stretch',
+    justify: 'start'
+  }, {
+    id: 'title',
+    component: 'Text',
+    text: '发现的星闪设备',
+    variant: 'h3'
+  }];
+
+  const limit = devices.length > MAX_DEVICE_ROWS ? MAX_DEVICE_ROWS : devices.length;
+  for (let index = 0; index < limit; index++) {
+    const device = devices[index];
+    const rowId = `row_${index}`;
+    const nameId = `name_${index}`;
+    const idId = `id_${index}`;
+    const divId = `div_${index}`;
+    children.push(rowId);
+    components.push({
+      id: rowId,
+      component: 'Row',
+      children: [nameId, idId],
+      align: 'center',
+      justify: 'space-between'
+    });
+    components.push({
+      id: nameId,
+      component: 'Text',
+      text: device.deviceName.length > 0 ? device.deviceName : '(未命名设备)',
+      variant: 'body'
+    });
+    components.push({
+      id: idId,
+      component: 'Text',
+      text: device.address,
+      variant: 'caption'
+    });
+    components.push({
+      id: divId,
+      component: 'Divider'
+    });
+    children.push(divId);
+  }
+
+  if (devices.length === 0) {
+    components.push({
+      id: 'empty',
+      component: 'Text',
+      text: '未发现星闪设备',
+      variant: 'caption'
+    });
+    children.push('empty');
+  }
+
+  return components;
+}
+
+/**
+ * 生成星闪设备卡片的 A2UI JSONL，供 nearlink_device search 结果确定性渲染。
+ */
+export function buildNearLinkDeviceCardJsonl(devices: NearLinkDevice[]): string {
+  const surfaceId = newSurfaceId();
+  const createLine = buildCreateSurface(surfaceId);
+
+  const components = buildNearLinkDeviceCardComponents(devices);
   const updateBody: UpdateComponentsBody = {
     surfaceId: surfaceId,
     components: components

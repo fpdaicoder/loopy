@@ -1,5 +1,4 @@
 import { common } from '@kit.AbilityKit';
-import { distributedDeviceManager } from '@kit.DistributedServiceKit';
 import { ComposioConfig } from '../composio/ComposioConfig';
 import { ComposioSessionClient } from '../composio/ComposioSessionClient';
 import { ComposioTool } from '../composio/ComposioTool';
@@ -8,9 +7,10 @@ import { PhotoAlbumTool } from '../album/PhotoAlbumTool';
 import { ModelScopeConfig } from '../modelscope/ModelScopeConfig';
 import { ModelScopeDirectClient } from '../modelscope/ModelScopeDirectClient';
 import { ModelScopeTool } from '../modelscope/ModelScopeTool';
-import { DeviceManagerClient, DiscoveredDevice } from '../distributed/DeviceManagerClient';
-import { AbilityConnectionClient } from '../distributed/AbilityConnectionClient';
-import { DistributedDeviceTool } from '../distributed/DistributedDeviceTool';
+import { NearLinkScanner } from '../nearlink/NearLinkScanner';
+import { NearLinkTransport } from '../nearlink/NearLinkTransport';
+import { NearLinkDeviceTool } from '../nearlink/NearLinkDeviceTool';
+import { FileReassembler } from '../nearlink/FileReassembler';
 import { SkillReadTool } from '../skill/SkillReadTool';
 import { SkillSnapshot } from '../skill/SkillSnapshot';
 import { AgentTool } from './AgentTool';
@@ -156,24 +156,41 @@ export async function createConfiguredLoopToolRegistry(
   await modelScopeClient.initialize();
   registry.register(new ModelScopeTool(modelScopeClient));
 
-  // 分布式设备管理：发现 + 绑定 + 跨设备消息收发。
-  const dmClient = new DeviceManagerClient(context);
-  await dmClient.initialize();
-  const connClient = new AbilityConnectionClient(context, dmClient);
-  await connClient.initialize();
-  const distributedTool = new DistributedDeviceTool(dmClient, connClient);
-  registry.register(distributedTool);
-  registry.registerUiPayloadProvider('distributed_device', (): string => distributedTool.consumeUiPayload());
-  // 绑定成功（设备 AVAILABLE）时通知 UI 刷新行状态为已绑定。
-  dmClient.onStateChange((action: distributedDeviceManager.DeviceStateChange, device: DiscoveredDevice): void => {
-    if (action === distributedDeviceManager.DeviceStateChange.AVAILABLE && device.deviceId.length > 0) {
-      registry.notifyDeviceBound(device.deviceId);
-    }
-  });
-  registry.registerCloseHandler(async (): Promise<void> => { await connClient.close(); await dmClient.close(); });
+  // 星闪（NearLink）：设备扫描 + 端口数据传输。softbus 已屏蔽，星闪为唯一跨设备发现/建链/传输通道。
+  // dataTransfer 从 5.1.0(18) 起支持（compatibleSdkVersion 已提升）。构造即 createPort 注册端口，
+  // source/sink 双端对称；source 扫描后 connect，sink 启动广播等连接。
+  // 复用 EntryAbility（sink 端）已建的 transport（若 onCreate 先于 Index 建好），避免重复 createPort；
+  // source 端（EntryAbility 未建 transport）则在此新建。
+  const nearLinkScanner = new NearLinkScanner();
+  const existingTransport = AppStorage.get<NearLinkTransport>('loopNearLinkTransport');
+  const nearLinkTransport = existingTransport !== undefined && existingTransport !== null
+    ? existingTransport
+    : new NearLinkTransport();
+  if (existingTransport === undefined || existingTransport === null) {
+    AppStorage.setOrCreate<NearLinkTransport>('loopNearLinkTransport', nearLinkTransport);
+  }
+  // source 端也注册 FileReassembler，使 sink→source 回发照片/文件走星闪双向闭环。
+  // sink 端的 reassembler 由 EntryAbility.setupNearLinkReceiver 注册；两端 transport 实例不同时
+  // 各自注册不冲突（readData 回调按端口实例分发）。复用同一 AppStorage transport 时，
+  // EntryAbility 已注册过 sink reassembler，此处按 source role 再注册一个——
+  // transport.registerDataHandler 是单 handler 覆盖语义，故仅在本端 transport 尚未注册时设置。
+  if (existingTransport === undefined || existingTransport === null) {
+    const sourceReassembler = new FileReassembler(context, 'source');
+    nearLinkTransport.registerDataHandler((data: ArrayBuffer, _fromAddress: string): boolean => {
+      return sourceReassembler.handleData(data);
+    });
+  }
+  const nearLinkTool = new NearLinkDeviceTool(nearLinkScanner, nearLinkTransport);
+  registry.register(nearLinkTool);
+  registry.registerUiPayloadProvider('nearlink_device', (): string => nearLinkTool.consumeUiPayload());
+  // 注意：不注册 nearLinkTransport.close() 为 registry closeHandler。
+  // transport 是跨 registry 复用的进程级单例（EntryAbility/ToolRegistry 共用同一 AppStorage 实例），
+  // Index 在 llm 模式重建 registry 时会调旧 registry.close()——若 close() 清掉 transport 的
+  // connected/peerAddress/textMessageListeners，会导致刚收到的对端连接被误判断开（agent 看到 disconnected）。
+  // transport 的生命周期随进程，不随 registry 重建。
 
-  // 相册选择：仅 pick（PhotoViewPicker 系统选择器）；选完若已连接对端，自动读字节经 sendData 发送。
-  const photoAlbumTool = new PhotoAlbumTool(context, connClient);
+  // 相册选择：仅 pick（PhotoViewPicker 系统选择器）；选完若星闪已连接，自动读字节分片发送。
+  const photoAlbumTool = new PhotoAlbumTool(nearLinkTransport);
   registry.register(photoAlbumTool);
   return registry;
 }

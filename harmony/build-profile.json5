@@ -5,13 +5,13 @@
         "name": "default",
         "type": "HarmonyOS",
         "material": {
-          "certpath": "/Users/raymondkwan/.ohos/config/default_harmony_E_1KZ4eCVjJVlhTxn29meHPlrUVk4FGRK62FX8rMbCQ=.cer",
+          "certpath": "C:\\Users\\fpdai\\.ohos\\config\\default_harmony_SexIg5cYxQHN9tNK_c9LlwLqWWnbo_Ym8zlYJyYrxIY=.cer",
           "keyAlias": "debugKey",
-          "keyPassword": "0000001928E74BC2CC74938961DB8E52A224C54575C1F69BC3A8F845DA0C2490F175A5928409B86E97",
-          "profile": "/Users/raymondkwan/.ohos/config/default_harmony_E_1KZ4eCVjJVlhTxn29meHPlrUVk4FGRK62FX8rMbCQ=.p7b",
+          "keyPassword": "0000001B8ECFA5B2EF3ECA9EA88AB883207CBC4BEFC135BEFD9C691D784EBFCDDE6F6DADE69BC05200B288",
+          "profile": "C:\\Users\\fpdai\\.ohos\\config\\default_harmony_SexIg5cYxQHN9tNK_c9LlwLqWWnbo_Ym8zlYJyYrxIY=.p7b",
           "signAlg": "SHA256withECDSA",
-          "storeFile": "/Users/raymondkwan/.ohos/config/default_harmony_E_1KZ4eCVjJVlhTxn29meHPlrUVk4FGRK62FX8rMbCQ=.p12",
-          "storePassword": "00000019CF3FE46311512DD5F7E717646AC418E342B37DED8256FE37B0DFAC22C679BB139E2DCC3129"
+          "storeFile": "C:\\Users\\fpdai\\.ohos\\config\\default_harmony_SexIg5cYxQHN9tNK_c9LlwLqWWnbo_Ym8zlYJyYrxIY=.p12",
+          "storePassword": "0000001B26C93690DD754F55A94FFE5CEB39B8E5D16E6BD401C8B146F7310F62D77C1992EB7A8674099CA5"
         }
       }
     ],
@@ -19,9 +19,10 @@
       {
         "name": "default",
         "signingConfig": "default",
-        "compatibleSdkVersion": "5.0.5(17)",
+        "compileSdkVersion": "26.0.0",
+        "compatibleSdkVersion": "26.0.0",
         "runtimeOS": "HarmonyOS",
-        "targetSdkVersion": "6.1.0(23)",
+        "targetSdkVersion": "26.0.0",
         "buildOption": {
           "strictMode": {
             "useNormalizedOHMUrl": true

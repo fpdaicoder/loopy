@@ -23,16 +23,6 @@
         }
       },
       {
-        "name": "ohos.permission.DISTRIBUTED_DATASYNC",
-        "reason": "$string:distributed_permission_reason",
-        "usedScene": {
-          "abilities": [
-            "EntryAbility"
-          ],
-          "when": "inuse"
-        }
-      },
-      {
         "name": "ohos.permission.GET_NETWORK_INFO",
         "reason": "$string:network_info_permission_reason",
         "usedScene": {
@@ -45,6 +35,16 @@
       {
         "name": "ohos.permission.SET_NETWORK_INFO",
         "reason": "$string:network_info_permission_reason",
+        "usedScene": {
+          "abilities": [
+            "EntryAbility"
+          ],
+          "when": "inuse"
+        }
+      },
+      {
+        "name": "ohos.permission.ACCESS_NEARLINK",
+        "reason": "$string:nearlink_permission_reason",
         "usedScene": {
           "abilities": [
             "EntryAbility"
